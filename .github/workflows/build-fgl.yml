@@ -40,11 +40,11 @@ jobs:
           "$HOME/bin/repo" init -u https://github.com/nova-video-player/aos-AVP -b nova
           "$HOME/bin/repo" sync -j4 --fail-fast
           "$HOME/bin/repo" forall -c 'git checkout -B local-fgl "$REPO_LREV" || true'
-      - name: Apply Samsung storage and FGL label patches
+      - name: Apply FGL storage and label patches
         working-directory: source
         run: |
           python3 ../fgl/patches/samsung-a16/apply_all_files_access.py
-          python3 ../fgl/patches/samsung-a16/apply_usb_saf_fix.py
+          python3 ../fgl/patches/samsung-a16/apply_fgl_storage_mode.py
           python3 ../fgl/patches/samsung-a16/apply_fgl_name.py
       - name: Compile FGL debug APK using Nova special-storage flavor
         working-directory: source/Video
@@ -57,11 +57,11 @@ jobs:
           find source/Video/build/outputs/apk -type f -name '*.apk' -print
           apk="$(find source/Video/build/outputs/apk/manageexternalstorage/debug -type f -name '*.apk' | head -n 1)"
           test -n "$apk"
-          cp "$apk" artifacts/Nova-FGL-Samsung-A16-v1-debug.apk
+          cp "$apk" artifacts/Nova-FGL-Samsung-A16-v2-debug.apk
           sha256sum artifacts/*.apk
       - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
-          name: Nova-FGL-Samsung-A16-v1
-          path: artifacts/Nova-FGL-Samsung-A16-v1-debug.apk
+          name: Nova-FGL-Samsung-A16-v2
+          path: artifacts/Nova-FGL-Samsung-A16-v2-debug.apk
           if-no-files-found: error
