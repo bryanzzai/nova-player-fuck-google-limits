@@ -41,6 +41,7 @@ import android.database.Cursor;
 import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Handler;
+import android.view.KeyEvent;
 import android.os.Looper;
 import android.provider.BaseColumns;
 import android.view.WindowManager;
@@ -82,6 +83,7 @@ public final class FglLibraryManager {
     private static final int IMPORT_WAIT_ATTEMPTS = 15 * 60;
     private static final long IMPORT_WAIT_DELAY_MS = 1000L;
     private static final AtomicBoolean sScanRunning = new AtomicBoolean(false);
+    private static final AtomicBoolean sCancelRequested = new AtomicBoolean(false);
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Set<String> VIDEO_EXTENSIONS = new HashSet<>(Arrays.asList(
             "3gp", "3g2", "asf", "avi", "divx", "flv", "m2ts", "m4v", "mkv",
@@ -117,10 +119,12 @@ public final class FglLibraryManager {
 
     private static void scanRoot(Context context, File root, boolean explicit, ProgressReporter progress) {
         if (!root.isDirectory() || !sScanRunning.compareAndSet(false, true)) return;
+        sCancelRequested.set(false);
         progress.preparing();
         new Thread(() -> {
             ArrayList<String> videoPaths = new ArrayList<>();
             collectVideoPaths(root, videoPaths);
+            if (finishIfCancelled(progress)) return;
             if (videoPaths.isEmpty()) {
                 sScanRunning.set(false);
                 progress.finished(context.getString(R.string.fgl_library_no_videos));
@@ -134,6 +138,7 @@ public final class FglLibraryManager {
 
     private static void scanBatch(Context context, File root, ArrayList<String> paths, int offset,
             AtomicInteger scannedCount, ProgressReporter progress, String workerName) {
+        if (finishIfCancelled(progress)) return;
         if (offset >= paths.size()) {
             onMediaScanComplete(context, root, paths.size(), progress, workerName);
             return;
@@ -142,6 +147,7 @@ public final class FglLibraryManager {
         String[] batch = paths.subList(offset, end).toArray(new String[0]);
         AtomicInteger batchCount = new AtomicInteger();
         MediaScannerConnection.scanFile(context, batch, null, (path, scannedUri) -> {
+            if (finishIfCancelled(progress)) return;
             int scanned = scannedCount.incrementAndGet();
             progress.scanning(scanned, paths.size());
             if (batchCount.incrementAndGet() == batch.length) {
@@ -152,6 +158,7 @@ public final class FglLibraryManager {
 
     private static void onMediaScanComplete(Context context, File root, int expectedVideos,
             ProgressReporter progress, String workerName) {
+        if (finishIfCancelled(progress)) return;
         PreferenceManager.getDefaultSharedPreferences(context)
                 .edit().putLong(PREF_LAST_SCAN, System.currentTimeMillis()).apply();
         progress.importing(0, expectedVideos, 0);
@@ -177,6 +184,7 @@ public final class FglLibraryManager {
             ProgressReporter progress) {
         int indexed = 0;
         for (int attempt = 0; attempt < IMPORT_WAIT_ATTEMPTS; attempt++) {
+            if (finishIfCancelled(progress)) return;
             try {
                 Thread.sleep(IMPORT_WAIT_DELAY_MS);
             } catch (InterruptedException e) {
@@ -212,9 +220,11 @@ public final class FglLibraryManager {
     }
 
     private static void collectVideoPaths(File directory, ArrayList<String> output) {
+        if (sCancelRequested.get()) return;
         File[] entries = directory.listFiles();
         if (entries == null) return;
         for (File entry : entries) {
+            if (sCancelRequested.get()) return;
             if (entry.isDirectory()) {
                 collectVideoPaths(entry, output);
             } else if (entry.isFile() && isVideoFile(entry.getName())) {
@@ -227,6 +237,17 @@ public final class FglLibraryManager {
         int dot = name.lastIndexOf('.');
         return dot >= 0 && dot < name.length() - 1
                 && VIDEO_EXTENSIONS.contains(name.substring(dot + 1).toLowerCase(Locale.ROOT));
+    }
+
+    /** The back arrow is the only user gesture that may interrupt this job. */
+    private static void cancelCurrentScan() {
+        sCancelRequested.set(true);
+    }
+
+    private static boolean finishIfCancelled(ProgressReporter progress) {
+        if (!sCancelRequested.get()) return false;
+        if (sScanRunning.getAndSet(false)) progress.cancelled();
+        return true;
     }
 
     private static final class ProgressReporter {
@@ -260,6 +281,15 @@ public final class FglLibraryManager {
                 // an explicit OK button appears when this job has a result.
                 dialog.setCancelable(false);
                 dialog.setCanceledOnTouchOutside(false);
+                dialog.setOnKeyListener((ignored, keyCode, event) -> {
+                    if (keyCode == KeyEvent.KEYCODE_BACK
+                            && event.getAction() == KeyEvent.ACTION_UP) {
+                        cancelCurrentScan();
+                        dialog.dismiss();
+                        return true;
+                    }
+                    return keyCode == KeyEvent.KEYCODE_BACK;
+                });
                 owner.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 dialog.show();
             });
@@ -309,6 +339,16 @@ public final class FglLibraryManager {
                 dialog.setButton(DialogInterface.BUTTON_POSITIVE,
                         context.getString(android.R.string.ok),
                         (ignored, which) -> dialog.dismiss());
+            });
+        }
+
+        void cancelled() {
+            if (context == null) return;
+            MAIN.post(() -> {
+                Activity owner = activity.get();
+                if (owner != null && !owner.isFinishing())
+                    owner.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                if (dialog != null && dialog.isShowing()) dialog.dismiss();
             });
         }
     }
