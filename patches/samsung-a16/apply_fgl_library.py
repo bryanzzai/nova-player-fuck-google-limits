@@ -34,6 +34,7 @@ package com.archos.mediacenter.video.fgl;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
@@ -73,7 +74,11 @@ public final class FglLibraryManager {
     private static final String PREF_LAST_SCAN = "fgl_library_last_scan";
     private static final long RESCAN_INTERVAL_MS = 15 * 60 * 1000L;
     private static final int SCAN_BATCH_SIZE = 50;
-    private static final int IMPORT_WAIT_ATTEMPTS = 90;
+    // On a removable card, Android's MediaStore and Nova's import database can
+    // take several minutes to settle after the file scanner has finished.
+    // Keep reporting that distinct phase instead of treating 90 seconds as a
+    // silent failure.
+    private static final int IMPORT_WAIT_ATTEMPTS = 15 * 60;
     private static final long IMPORT_WAIT_DELAY_MS = 1000L;
     private static final AtomicBoolean sScanRunning = new AtomicBoolean(false);
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
@@ -148,7 +153,7 @@ public final class FglLibraryManager {
             ProgressReporter progress, String workerName) {
         PreferenceManager.getDefaultSharedPreferences(context)
                 .edit().putLong(PREF_LAST_SCAN, System.currentTimeMillis()).apply();
-        progress.importing(0, expectedVideos);
+        progress.importing(0, expectedVideos, 0);
         try {
             Intent importIntent = new Intent(context, VideoStoreImportService.class);
             importIntent.setAction(ArchosMediaIntent.ACTION_VIDEO_SCANNER_IMPORT_INCR);
@@ -172,7 +177,7 @@ public final class FglLibraryManager {
                 break;
             }
             indexed = countIndexedVideos(context, root.getPath());
-            progress.importing(indexed, expectedVideos);
+            progress.importing(indexed, expectedVideos, attempt + 1);
             if (indexed >= expectedVideos) {
                 AutoScrapeService.startServiceForRoot(context, root.getPath());
                 sScanRunning.set(false);
@@ -243,7 +248,11 @@ public final class FglLibraryManager {
                 dialog.setMessage(context.getString(R.string.fgl_library_preparing));
                 dialog.setProgressStyle(NovaProgressDialog.STYLE_HORIZONTAL);
                 dialog.setIndeterminate(true);
-                dialog.setCancelable(true);
+                // A tap outside the dialog must not make a long-running scan
+                // look as if it stopped. The user can always leave the app;
+                // an explicit OK button appears when this job has a result.
+                dialog.setCancelable(false);
+                dialog.setCanceledOnTouchOutside(false);
                 dialog.show();
             });
         }
@@ -268,13 +277,14 @@ public final class FglLibraryManager {
             });
         }
 
-        void importing(int current, int total) {
+        void importing(int current, int total, int elapsedSeconds) {
             if (context == null) return;
             MAIN.post(() -> {
                 if (dialog == null || !dialog.isShowing()) return;
                 dialog.setMax(total);
                 dialog.setProgress(Math.min(current, total));
-                dialog.setMessage(context.getString(R.string.fgl_library_importing, current, total));
+                dialog.setMessage(context.getString(R.string.fgl_library_importing,
+                        current, total, elapsedSeconds / 60, elapsedSeconds % 60));
             });
         }
 
@@ -283,9 +293,11 @@ public final class FglLibraryManager {
             MAIN.post(() -> {
                 if (dialog == null || !dialog.isShowing()) return;
                 dialog.setMessage(message);
-                MAIN.postDelayed(() -> {
-                    if (dialog != null && dialog.isShowing()) dialog.dismiss();
-                }, 1500L);
+                dialog.setCancelable(true);
+                dialog.setCanceledOnTouchOutside(false);
+                dialog.setButton(DialogInterface.BUTTON_POSITIVE,
+                        context.getString(android.R.string.ok),
+                        (ignored, which) -> dialog.dismiss());
             });
         }
     }
@@ -379,7 +391,7 @@ src = replace_once(
     "    <string name=\"fgl_library_dialog_title\">Nova FGL library</string>\n"
     "    <string name=\"fgl_library_preparing\">Finding video files…</string>\n"
     "    <string name=\"fgl_library_indexing\">Indexing %1$d of %2$d video files</string>\n"
-    "    <string name=\"fgl_library_importing\">Adding %1$d of %2$d videos to Nova</string>\n"
+    "    <string name=\"fgl_library_importing\">Adding %1$d of %2$d videos to Nova (%3$d:%4$02d)</string>\n"
     "    <string name=\"fgl_library_scraping\">Indexed %1$d videos. Fetching metadata…</string>\n"
     "    <string name=\"fgl_library_no_videos\">No video files were found in this library</string>\n"
     "    <string name=\"fgl_library_import_failed\">Only %1$d of %2$d videos reached Nova’s library</string>\n",
