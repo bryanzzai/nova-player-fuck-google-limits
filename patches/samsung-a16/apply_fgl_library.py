@@ -23,9 +23,9 @@ main_activity = video_root / "src/main/java/com/archos/mediacenter/video/browser
 strings = video_root / "res/values/strings.xml"
 manager = video_root / "src/main/java/com/archos/mediacenter/video/fgl/FglLibraryManager.java"
 auto_scraper = media_root / "src/com/archos/mediascraper/AutoScrapeService.java"
-import_impl = media_root / "src/com/archos/mediaprovider/video/VideoStoreImportImpl.java"
+network_scanner = media_root / "src/com/archos/mediaprovider/video/NetworkScannerServiceVideo.java"
 
-for path in (folder_browser, main_activity, strings, auto_scraper, import_impl):
+for path in (folder_browser, main_activity, strings, auto_scraper, network_scanner):
     if not path.is_file():
         raise SystemExit(f"Missing {path}: sync Nova component sources before applying the FGL library patch")
 
@@ -39,7 +39,6 @@ import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
-import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Handler;
 import android.view.KeyEvent;
@@ -55,8 +54,7 @@ import com.archos.mediacenter.video.R;
 import com.archos.mediacenter.video.ui.NovaProgressDialog;
 import com.archos.mediaprovider.ArchosMediaIntent;
 import com.archos.mediaprovider.video.VideoStore;
-import com.archos.mediaprovider.video.VideoStoreImportService;
-import com.archos.mediaprovider.video.VideoStoreImportImpl;
+import com.archos.mediaprovider.video.NetworkScannerServiceVideo;
 import com.archos.mediascraper.AutoScrapeService;
 
 import java.io.File;
@@ -135,56 +133,27 @@ public final class FglLibraryManager {
                 return;
             }
             progress.filesFound(videoPaths.size());
-            scanBatch(context, root, videoPaths, 0, new AtomicInteger(), progress,
+            startDirectFglScan(context, root, videoPaths.size(), progress,
                     explicit ? "FglLibraryInitialScan" : "FglLibraryRefresh");
         }, explicit ? "FglLibraryInitialScan" : "FglLibraryRefresh").start();
     }
 
-    private static void scanBatch(Context context, File root, ArrayList<String> paths, int offset,
-            AtomicInteger scannedCount, ProgressReporter progress, String workerName) {
-        if (finishIfCancelled(progress)) return;
-        if (offset >= paths.size()) {
-            onMediaScanComplete(context, root, paths.size(), progress, workerName);
-            return;
-        }
-        int end = Math.min(offset + SCAN_BATCH_SIZE, paths.size());
-        String[] batch = paths.subList(offset, end).toArray(new String[0]);
-        AtomicInteger batchCount = new AtomicInteger();
-        MediaScannerConnection.scanFile(context, batch, null, (path, scannedUri) -> {
-            if (finishIfCancelled(progress)) return;
-            int scanned = scannedCount.incrementAndGet();
-            progress.scanning(scanned, paths.size());
-            if (batchCount.incrementAndGet() == batch.length) {
-                scanBatch(context, root, paths, end, scannedCount, progress, workerName);
-            }
-        });
-    }
-
-    private static void onMediaScanComplete(Context context, File root, int expectedVideos,
+    private static void startDirectFglScan(Context context, File root, int expectedVideos,
             ProgressReporter progress, String workerName) {
         if (finishIfCancelled(progress)) return;
         PreferenceManager.getDefaultSharedPreferences(context)
                 .edit().putLong(PREF_LAST_SCAN, System.currentTimeMillis()).apply();
         progress.importing(0, expectedVideos, 0);
-        // A full Nova import walks every item in the device-wide MediaStore
-        // before it publishes any of this library's rows.  On a large removable
-        // card that leaves this dialog at “0” for minutes.  Import only the
-        // already-scanned FGL root through Nova's own files_import table.
-        new Thread(() -> {
-            try {
-                VideoStoreImportImpl importer = new VideoStoreImportImpl(context);
-                try {
-                    importer.importFglLibraryRoot(root.getPath());
-                } finally {
-                    importer.destroy();
-                }
-            } catch (Exception e) {
-                sScanRunning.set(false);
-                progress.finished(context.getString(R.string.fgl_library_import_failed, 0, expectedVideos));
-                return;
-            }
-            waitForImport(context, root, expectedVideos, progress);
-        }, workerName + "RootImport").start();
+        // MediaStore is unreliable for the user-approved USB/SD root on this
+        // device. Use Nova's proven recursive scanner instead: it walks
+        // MetaFile2 directly and writes Nova's files table, just as SMB does.
+        if (!NetworkScannerServiceVideo.startFglLocalScan(context, Uri.fromFile(root))) {
+            sScanRunning.set(false);
+            progress.finished(context.getString(R.string.fgl_library_import_failed, 0, expectedVideos));
+            return;
+        }
+        new Thread(() -> waitForImport(context, root, expectedVideos, progress),
+                workerName + "DirectScanWait").start();
     }
 
     private static void waitForImport(Context context, File root, int expectedVideos,
@@ -214,10 +183,13 @@ public final class FglLibraryManager {
     private static int countIndexedVideos(Context context, String rootPath) {
         Cursor cursor = null;
         try {
+            String fileUriRoot = Uri.fromFile(new File(rootPath)).toString();
             cursor = context.getContentResolver().query(
                     VideoStore.Video.Media.EXTERNAL_CONTENT_URI,
                     new String[]{ BaseColumns._ID },
-                    VideoStore.MediaColumns.DATA + " LIKE ?", new String[]{ rootPath + "/%" }, null);
+                    "(" + VideoStore.MediaColumns.DATA + " LIKE ? OR "
+                            + VideoStore.MediaColumns.DATA + " LIKE ?)",
+                    new String[]{ rootPath + "/%", fileUriRoot + "/%" }, null);
             return cursor == null ? 0 : cursor.getCount();
         } catch (Exception ignored) {
             return 0;
@@ -387,67 +359,35 @@ public final class FglLibraryManager {
 }
 ''')
 
-src = import_impl.read_text()
+src = network_scanner.read_text()
 src = replace_once(
     src,
-    "    public void doFullImport() {\n",
+    "    public static boolean startIfHandles(Context context, Intent broadcast) {\n",
     '''    /**
-     * Import just one already MediaScanner-indexed local root.  This is the
-     * FGL path: it avoids blocking the user behind a device-wide import before
-     * the selected USB/SD library becomes visible.
+     * FGL's local-library entrypoint.  The normal receiver deliberately
+     * rejects file:// URLs because they belong to MediaStore; FGL has explicit
+     * all-files consent and uses this direct, root-scoped call instead.
      */
-    public int importFglLibraryRoot(String rootPath) {
-        if (TextUtils.isEmpty(rootPath)) return 0;
-        mIsImportInterrupted = false;
-        Cursor allFiles = null;
-        Cursor existing = null;
+    public static boolean startFglLocalScan(Context context, Uri root) {
+        if (root == null || !"file".equals(root.getScheme())) return false;
+        Intent intent = new Intent(context, NetworkScannerServiceVideo.class);
+        intent.setAction(ArchosMediaIntent.ACTION_VIDEO_SCANNER_SCAN_FILE);
+        intent.setData(root);
+        if (Build.VERSION.SDK_INT >= 29) intent.setIdentifier(root.toString());
         try {
-            ensureSdCardPath();
-            final boolean modern = Build.VERSION.SDK_INT > Build.VERSION_CODES.O;
-            String selection = (modern ? WHERE_ALL_AP : WHERE_ALL_BP) + BLACKLIST
-                    + " AND " + MediaColumnsDATA + " LIKE ?"
-                    + " AND " + FileColumns.MEDIA_TYPE + "=?";
-            String[] args = new String[]{rootPath + "/%",
-                    String.valueOf(FileColumns.MEDIA_TYPE_VIDEO)};
-            String[] projection = modern ? FILES_PROJECTION_AP : FILES_PROJECTION_BP;
-            allFiles = CustomCursor.wrap(mCr.query(MediaStore.Files.getContentUri("external"),
-                    projection, selection, args, BaseColumns._ID));
-            if (allFiles == null) return 0;
-
-            HashSet<Long> importedIds = new HashSet<>();
-            existing = mCr.query(VideoStoreInternal.FILES_IMPORT,
-                    new String[]{BaseColumns._ID}, null, null, null);
-            if (existing != null) {
-                while (existing.moveToNext() && !mIsImportInterrupted)
-                    importedIds.add(existing.getLong(0));
-            }
-
-            BulkInserter inserter = new BulkInserter(VideoStoreInternal.FILES_IMPORT, mCr, 250);
-            ExtStorageManager extStorageManager = ExtStorageManager.getExtStorageManager();
-            int columnCount = allFiles.getColumnCount();
-            while (allFiles.moveToNext() && !mIsImportInterrupted) {
-                ContentValues values = new ContentValues(columnCount + 1);
-                DatabaseUtils.cursorRowToContentValues(allFiles, values);
-                Long id = values.getAsLong(BaseColumns._ID);
-                if (id == null || importedIds.contains(id)) continue;
-                String data = values.getAsString(MediaColumnsDATA);
-                Integer storageId = data != null && data.startsWith(sdCardPath)
-                        ? 1 : extStorageManager.getStorageId3(data);
-                values.put("storage_id", storageId);
-                inserter.add(values);
-            }
-            return inserter.execute();
-        } finally {
-            if (existing != null) existing.close();
-            if (allFiles != null) allFiles.close();
+            context.startService(intent);
+            return true;
+        } catch (Exception e) {
+            log.warn("startFglLocalScan: unable to start {}", root, e);
+            return false;
         }
     }
 
-    public void doFullImport() {
+    public static boolean startIfHandles(Context context, Intent broadcast) {
 ''',
-    "FGL root-only MediaStore import",
+    "FGL direct local scanner entrypoint",
 )
-import_impl.write_text(src)
+network_scanner.write_text(src)
 
 src = folder_browser.read_text()
 src = replace_once(
@@ -683,7 +623,8 @@ src = replace_once(
     '''    private String appendRootFilter(String where) {
         String rootPath = mScrapeRootPath.get();
         return rootPath == null || rootPath.isEmpty() ? where
-                : where + " AND " + VideoStore.MediaColumns.DATA + " LIKE ?";
+                : where + " AND (" + VideoStore.MediaColumns.DATA + " LIKE ? OR "
+                + VideoStore.MediaColumns.DATA + " LIKE ?)";
     }
 
     private String[] selectionArgsForRoot(String cameraPath, String afterId) {
@@ -692,8 +633,10 @@ src = replace_once(
             return afterId == null ? new String[]{ cameraPath + "/%" }
                     : new String[]{ cameraPath + "/%", afterId };
         }
-        return afterId == null ? new String[]{ cameraPath + "/%", rootPath + "/%" }
-                : new String[]{ cameraPath + "/%", rootPath + "/%", afterId };
+        String fileUriRoot = "file://" + rootPath;
+        return afterId == null
+                ? new String[]{ cameraPath + "/%", rootPath + "/%", fileUriRoot + "/%" }
+                : new String[]{ cameraPath + "/%", rootPath + "/%", fileUriRoot + "/%", afterId };
     }
 
     private Cursor getFileListCursor(int scrapStatusParam, String sortOrder, Integer offset, Integer limit) {
