@@ -313,7 +313,7 @@ public final class FglLibraryManager {
                 }
             };
             ((ComponentActivity) owner).getOnBackPressedDispatcher()
-                    .addCallback(owner, backCallback);
+                    .addCallback(backCallback);
         }
 
         private void removeBackInterceptor() {
