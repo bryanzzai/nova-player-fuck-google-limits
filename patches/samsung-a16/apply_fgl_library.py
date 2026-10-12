@@ -43,6 +43,7 @@ import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.BaseColumns;
+import android.view.WindowManager;
 
 import androidx.preference.PreferenceManager;
 
@@ -156,7 +157,13 @@ public final class FglLibraryManager {
         progress.importing(0, expectedVideos, 0);
         try {
             Intent importIntent = new Intent(context, VideoStoreImportService.class);
-            importIntent.setAction(ArchosMediaIntent.ACTION_VIDEO_SCANNER_IMPORT_INCR);
+            // Do not use Nova's incremental import here. It only copies Android
+            // MediaStore ids newer than Nova's previous maximum; Samsung's
+            // removable-volume rows can legitimately miss that shortcut. This
+            // is the same complete import Nova normally starts after storage
+            // access has been granted.
+            importIntent.setAction(ArchosMediaIntent.ACTION_VIDEO_SCANNER_STORAGE_PERMISSION_GRANTED);
+            importIntent.setData(Uri.fromFile(root));
             context.startService(importIntent);
         } catch (Exception e) {
             sScanRunning.set(false);
@@ -253,6 +260,7 @@ public final class FglLibraryManager {
                 // an explicit OK button appears when this job has a result.
                 dialog.setCancelable(false);
                 dialog.setCanceledOnTouchOutside(false);
+                owner.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 dialog.show();
             });
         }
@@ -293,6 +301,9 @@ public final class FglLibraryManager {
             MAIN.post(() -> {
                 if (dialog == null || !dialog.isShowing()) return;
                 dialog.setMessage(message);
+                Activity owner = activity.get();
+                if (owner != null && !owner.isFinishing())
+                    owner.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 dialog.setCancelable(true);
                 dialog.setCanceledOnTouchOutside(false);
                 dialog.setButton(DialogInterface.BUTTON_POSITIVE,
