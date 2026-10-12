@@ -32,37 +32,49 @@ manager.parent.mkdir(parents=True, exist_ok=True)
 manager.write_text('''// Copyright 2026 Nova FGL
 package com.archos.mediacenter.video.fgl;
 
+import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.database.Cursor;
 import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.BaseColumns;
 
 import androidx.preference.PreferenceManager;
 
+import com.archos.mediacenter.video.R;
+import com.archos.mediacenter.video.ui.NovaProgressDialog;
+import com.archos.mediaprovider.ArchosMediaIntent;
+import com.archos.mediaprovider.video.VideoStore;
+import com.archos.mediaprovider.video.VideoStoreImportService;
 import com.archos.mediascraper.AutoScrapeService;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * FGL's small library boundary: a local root, bulk MediaStore registration and
- * Nova's existing scraper limited to that root.  It intentionally does not
- * use a SAF tree URI.
+ * FGL's small library boundary: one local root, recursive registration in
+ * MediaStore, Nova database import and then Nova's existing root-scoped
+ * scraper. It intentionally does not use a SAF tree URI.
  */
 public final class FglLibraryManager {
     private static final String PREF_ROOT = "fgl_library_root";
     private static final String PREF_LAST_SCAN = "fgl_library_last_scan";
     private static final long RESCAN_INTERVAL_MS = 15 * 60 * 1000L;
-    private static final long SCRAPE_SETTLE_DELAY_MS = 6000L;
-    private static final long SCRAPE_RETRY_DELAY_MS = 25000L;
+    private static final int SCAN_BATCH_SIZE = 50;
+    private static final int IMPORT_WAIT_ATTEMPTS = 90;
+    private static final long IMPORT_WAIT_DELAY_MS = 1000L;
     private static final AtomicBoolean sScanRunning = new AtomicBoolean(false);
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Set<String> VIDEO_EXTENSIONS = new HashSet<>(Arrays.asList(
@@ -85,7 +97,7 @@ public final class FglLibraryManager {
         } catch (IOException ignored) { }
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
         prefs.edit().putString(PREF_ROOT, root.getPath()).putLong(PREF_LAST_SCAN, 0L).apply();
-        scanRoot(context.getApplicationContext(), root, true);
+        scanRoot(context.getApplicationContext(), root, true, ProgressReporter.create(context));
     }
 
     /** Called when Nova returns to foreground: new episodes are picked up without a SAF prompt. */
@@ -94,35 +106,97 @@ public final class FglLibraryManager {
         String rootPath = prefs.getString(PREF_ROOT, null);
         if (rootPath == null || rootPath.isEmpty()) return;
         if (System.currentTimeMillis() - prefs.getLong(PREF_LAST_SCAN, 0L) < RESCAN_INTERVAL_MS) return;
-        scanRoot(context.getApplicationContext(), new File(rootPath), false);
+        scanRoot(context.getApplicationContext(), new File(rootPath), false, ProgressReporter.NONE);
     }
 
-    private static void scanRoot(Context context, File root, boolean explicit) {
+    private static void scanRoot(Context context, File root, boolean explicit, ProgressReporter progress) {
         if (!root.isDirectory() || !sScanRunning.compareAndSet(false, true)) return;
+        progress.preparing();
         new Thread(() -> {
-            try {
-                ArrayList<String> videoPaths = new ArrayList<>();
-                collectVideoPaths(root, videoPaths);
-                PreferenceManager.getDefaultSharedPreferences(context)
-                        .edit().putLong(PREF_LAST_SCAN, System.currentTimeMillis()).apply();
-                if (videoPaths.isEmpty()) return;
-                MediaScannerConnection.scanFile(context,
-                        videoPaths.toArray(new String[0]), null,
-                        (path, scannedUri) -> { });
-                // The system scanner inserts MediaStore rows first; Nova's importer follows.
-                // Give that hand-off a short, bounded settling period before querying it.
-                requestRootScrape(context, root.getPath(), SCRAPE_SETTLE_DELAY_MS);
-                // Importing MediaStore rows is asynchronous. A bounded retry catches
-                // slow removable storage without turning this into a polling loop.
-                requestRootScrape(context, root.getPath(), SCRAPE_RETRY_DELAY_MS);
-            } finally {
+            ArrayList<String> videoPaths = new ArrayList<>();
+            collectVideoPaths(root, videoPaths);
+            if (videoPaths.isEmpty()) {
                 sScanRunning.set(false);
+                progress.finished(context.getString(R.string.fgl_library_no_videos));
+                return;
             }
+            progress.filesFound(videoPaths.size());
+            scanBatch(context, root, videoPaths, 0, new AtomicInteger(), progress,
+                    explicit ? "FglLibraryInitialScan" : "FglLibraryRefresh");
         }, explicit ? "FglLibraryInitialScan" : "FglLibraryRefresh").start();
     }
 
-    private static void requestRootScrape(Context context, String rootPath, long delayMs) {
-        MAIN.postDelayed(() -> AutoScrapeService.startServiceForRoot(context, rootPath), delayMs);
+    private static void scanBatch(Context context, File root, ArrayList<String> paths, int offset,
+            AtomicInteger scannedCount, ProgressReporter progress, String workerName) {
+        if (offset >= paths.size()) {
+            onMediaScanComplete(context, root, paths.size(), progress, workerName);
+            return;
+        }
+        int end = Math.min(offset + SCAN_BATCH_SIZE, paths.size());
+        String[] batch = paths.subList(offset, end).toArray(new String[0]);
+        AtomicInteger batchCount = new AtomicInteger();
+        MediaScannerConnection.scanFile(context, batch, null, (path, scannedUri) -> {
+            int scanned = scannedCount.incrementAndGet();
+            progress.scanning(scanned, paths.size());
+            if (batchCount.incrementAndGet() == batch.length) {
+                scanBatch(context, root, paths, end, scannedCount, progress, workerName);
+            }
+        });
+    }
+
+    private static void onMediaScanComplete(Context context, File root, int expectedVideos,
+            ProgressReporter progress, String workerName) {
+        PreferenceManager.getDefaultSharedPreferences(context)
+                .edit().putLong(PREF_LAST_SCAN, System.currentTimeMillis()).apply();
+        progress.importing(0, expectedVideos);
+        try {
+            Intent importIntent = new Intent(context, VideoStoreImportService.class);
+            importIntent.setAction(ArchosMediaIntent.ACTION_VIDEO_SCANNER_IMPORT_INCR);
+            context.startService(importIntent);
+        } catch (Exception e) {
+            sScanRunning.set(false);
+            progress.finished(context.getString(R.string.fgl_library_import_failed, 0, expectedVideos));
+            return;
+        }
+        new Thread(() -> waitForImport(context, root, expectedVideos, progress), workerName + "ImportWait").start();
+    }
+
+    private static void waitForImport(Context context, File root, int expectedVideos,
+            ProgressReporter progress) {
+        int indexed = 0;
+        for (int attempt = 0; attempt < IMPORT_WAIT_ATTEMPTS; attempt++) {
+            try {
+                Thread.sleep(IMPORT_WAIT_DELAY_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            indexed = countIndexedVideos(context, root.getPath());
+            progress.importing(indexed, expectedVideos);
+            if (indexed >= expectedVideos) {
+                AutoScrapeService.startServiceForRoot(context, root.getPath());
+                sScanRunning.set(false);
+                progress.finished(context.getString(R.string.fgl_library_scraping, indexed));
+                return;
+            }
+        }
+        sScanRunning.set(false);
+        progress.finished(context.getString(R.string.fgl_library_import_failed, indexed, expectedVideos));
+    }
+
+    private static int countIndexedVideos(Context context, String rootPath) {
+        Cursor cursor = null;
+        try {
+            cursor = context.getContentResolver().query(
+                    VideoStore.Video.Media.EXTERNAL_CONTENT_URI,
+                    new String[]{ BaseColumns._ID },
+                    VideoStore.MediaColumns.DATA + " LIKE ?", new String[]{ rootPath + "/%" }, null);
+            return cursor == null ? 0 : cursor.getCount();
+        } catch (Exception ignored) {
+            return 0;
+        } finally {
+            if (cursor != null) cursor.close();
+        }
     }
 
     private static void collectVideoPaths(File directory, ArrayList<String> output) {
@@ -141,6 +215,79 @@ public final class FglLibraryManager {
         int dot = name.lastIndexOf('.');
         return dot >= 0 && dot < name.length() - 1
                 && VIDEO_EXTENSIONS.contains(name.substring(dot + 1).toLowerCase(Locale.ROOT));
+    }
+
+    private static final class ProgressReporter {
+        static final ProgressReporter NONE = new ProgressReporter(null, null);
+
+        private final Context context;
+        private final WeakReference<Activity> activity;
+        private NovaProgressDialog dialog;
+
+        private ProgressReporter(Context context, Activity activity) {
+            this.context = context;
+            this.activity = new WeakReference<>(activity);
+        }
+
+        static ProgressReporter create(Context context) {
+            return context instanceof Activity ? new ProgressReporter(context, (Activity) context) : NONE;
+        }
+
+        void preparing() {
+            if (context == null) return;
+            MAIN.post(() -> {
+                Activity owner = activity.get();
+                if (owner == null || owner.isFinishing()) return;
+                dialog = new NovaProgressDialog(owner);
+                dialog.setTitle(R.string.fgl_library_dialog_title);
+                dialog.setMessage(context.getString(R.string.fgl_library_preparing));
+                dialog.setProgressStyle(NovaProgressDialog.STYLE_HORIZONTAL);
+                dialog.setIndeterminate(true);
+                dialog.setCancelable(true);
+                dialog.show();
+            });
+        }
+
+        void filesFound(int total) {
+            if (context == null) return;
+            MAIN.post(() -> {
+                if (dialog == null || !dialog.isShowing()) return;
+                dialog.setIndeterminate(false);
+                dialog.setMax(total);
+                dialog.setProgress(0);
+                dialog.setMessage(context.getString(R.string.fgl_library_indexing, 0, total));
+            });
+        }
+
+        void scanning(int current, int total) {
+            if (context == null) return;
+            MAIN.post(() -> {
+                if (dialog == null || !dialog.isShowing()) return;
+                dialog.setProgress(current);
+                dialog.setMessage(context.getString(R.string.fgl_library_indexing, current, total));
+            });
+        }
+
+        void importing(int current, int total) {
+            if (context == null) return;
+            MAIN.post(() -> {
+                if (dialog == null || !dialog.isShowing()) return;
+                dialog.setMax(total);
+                dialog.setProgress(Math.min(current, total));
+                dialog.setMessage(context.getString(R.string.fgl_library_importing, current, total));
+            });
+        }
+
+        void finished(String message) {
+            if (context == null) return;
+            MAIN.post(() -> {
+                if (dialog == null || !dialog.isShowing()) return;
+                dialog.setMessage(message);
+                MAIN.postDelayed(() -> {
+                    if (dialog != null && dialog.isShowing()) dialog.dismiss();
+                }, 1500L);
+            });
+        }
     }
 }
 ''')
@@ -226,7 +373,16 @@ src = strings.read_text()
 src = replace_once(
     src,
     "    <string name=\"workgroup\">Workgroup</string>\n",
-    "    <string name=\"workgroup\">Workgroup</string>\n    <string name=\"fgl_library_set_root\">Use as Nova FGL library</string>\n    <string name=\"fgl_library_scan_started\">Nova FGL is indexing this library</string>\n",
+    "    <string name=\"workgroup\">Workgroup</string>\n"
+    "    <string name=\"fgl_library_set_root\">Use as Nova FGL library</string>\n"
+    "    <string name=\"fgl_library_scan_started\">Nova FGL is indexing this library</string>\n"
+    "    <string name=\"fgl_library_dialog_title\">Nova FGL library</string>\n"
+    "    <string name=\"fgl_library_preparing\">Finding video files…</string>\n"
+    "    <string name=\"fgl_library_indexing\">Indexing %1$d of %2$d video files</string>\n"
+    "    <string name=\"fgl_library_importing\">Adding %1$d of %2$d videos to Nova</string>\n"
+    "    <string name=\"fgl_library_scraping\">Indexed %1$d videos. Fetching metadata…</string>\n"
+    "    <string name=\"fgl_library_no_videos\">No video files were found in this library</string>\n"
+    "    <string name=\"fgl_library_import_failed\">Only %1$d of %2$d videos reached Nova’s library</string>\n",
     "FGL library labels",
 )
 strings.write_text(src)

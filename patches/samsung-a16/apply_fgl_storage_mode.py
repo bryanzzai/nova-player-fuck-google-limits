@@ -37,7 +37,6 @@ for line in (
     "import androidx.appcompat.app.AlertDialog;\n",
     "import androidx.loader.app.LoaderManager;\n",
     "import com.archos.filecorelibrary.contentstorage.DocumentUriBuilder;\n",
-    "import com.archos.filecorelibrary.ListingEngine;\n",
     "import com.archos.mediacenter.filecoreextension.UriUtils;\n",
     "import com.archos.mediacenter.video.R;\n",
     "import java.io.File;\n",
@@ -54,6 +53,12 @@ if start != -1:
     src = src[:start] + src[end + 2:]
 src = src.replace("    private static final int READ_REQUEST_CODE = 42;\n", "")
 src = src.replace("    private boolean mHasAlreadyAsked = false;\n", "")
+src = src.replace(
+    "    private boolean mHasRegisteredReceiver;\n",
+    "    private boolean mHasRegisteredReceiver;\n"
+    "    private int mFglListingRetries;\n",
+    1,
+)
 src = replace_once(
     src,
     '''    @Override
@@ -87,6 +92,7 @@ src = replace_once(
     '''    @Override
     public void onResume() {
         super.onResume();
+        mFglListingRetries = 0;
         // FGL uses Android's already-approved all-files access.  Do not turn a
         // missing mount into a content:// SAF tree or open a document picker.
         IntentFilter iFilter = new IntentFilter();
@@ -105,7 +111,25 @@ if start != -1:
     end = src.find("    @Override\n    public void onSaveInstanceState", start)
     if end == -1:
         raise SystemExit("Unexpected upstream source while removing SAF permission dialog")
-    src = src[:start] + src[end:]
+    src = src[:start] + '''    @Override
+    public void onListingFatalError(Exception e, ListingEngine.ErrorEnum errorCode) {
+        if ((errorCode == ListingEngine.ErrorEnum.ERROR_AUTHENTICATION
+                || errorCode == ListingEngine.ErrorEnum.ERROR_NO_PERMISSION)
+                && mFglListingRetries < 3) {
+            int retry = ++mFglListingRetries;
+            // Android may still be publishing MANAGE_EXTERNAL_STORAGE just after
+            // the Settings screen closes. Retry the normal file listing; never
+            // fall back to SAF or leave Nova on a permanent loading page.
+            mHandler.removeCallbacksAndMessages(null);
+            mHandler.postDelayed(() -> {
+                if (isAdded()) listFiles(false);
+            }, 300L * retry);
+            return;
+        }
+        super.onListingFatalError(e, errorCode);
+    }
+
+''' + src[end:]
 start = src.find("    protected String getIndexableRootFolder()")
 if start != -1:
     end = src.find("    @Override\n    protected Uri getDefaultDirectory", start)
