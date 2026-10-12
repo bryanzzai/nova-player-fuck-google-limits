@@ -178,13 +178,58 @@ public final class FglLibraryManager {
             boolean scannerFinished = found > 0 && !NetworkScannerServiceVideo.isScannerAlive();
             if (scannerFinished && indexed > 0) {
                 AutoScrapeService.startServiceForRoot(context, root.getPath());
+                progress.scraperStatus("Starting Nova metadata scraper…", true, 0, 0);
+                new Thread(() -> watchScraperStatus(progress),
+                        "FglScraperStatus").start();
                 sScanRunning.set(false);
-                progress.finished(context.getString(R.string.fgl_library_scraping, indexed));
                 return;
             }
         }
         sScanRunning.set(false);
         progress.finished(context.getString(R.string.fgl_library_import_failed, indexed, expectedVideos));
+    }
+
+    /** Shows only actual scraper state reported by AutoScrapeService. */
+    private static void watchScraperStatus(ProgressReporter progress) {
+        for (int second = 0; second < 10 * 60; second++) {
+            if (sCancelRequested.get()) return;
+            int[] status = AutoScrapeService.getFglScrapeStatus();
+            switch (status[0]) {
+                case 0: // queued
+                    progress.scraperStatus("Waiting for Nova metadata scraper…", true, 0, 0);
+                    break;
+                case 1: // working
+                    progress.scraperStatus("Metadata: " + status[2] + " / " + status[1]
+                            + " processed; " + status[3] + " matched", false, status[1], status[2]);
+                    break;
+                case 2: // complete
+                    progress.finished("Metadata complete: " + status[2] + " processed; "
+                            + status[3] + " matched");
+                    return;
+                case 3: // empty selection
+                    progress.finished("Metadata scraper selected 0 Nova rows.");
+                    return;
+                case 4: // disabled by the Nova preference
+                    progress.finished("Nova's “Enable auto scrape” setting is off.");
+                    return;
+                case 5: // busy
+                    progress.finished("Another Nova metadata scraper is already active.");
+                    return;
+                case 6: // start error
+                    progress.finished("Nova metadata scraper could not be started.");
+                    return;
+                default:
+                    progress.finished("Unknown Nova scraper state.");
+                    return;
+            }
+            try {
+                Thread.sleep(1000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        progress.finished("Metadata scraper did not report a result within ten minutes.");
     }
 
     private static int countIndexedVideos(Context context, String rootPath) {
@@ -332,6 +377,19 @@ public final class FglLibraryManager {
                 dialog.setProgress(Math.min(current, total));
                 dialog.setMessage(context.getString(R.string.fgl_library_importing,
                         found, current, total, elapsedSeconds / 60, elapsedSeconds % 60));
+            });
+        }
+
+        void scraperStatus(String message, boolean indeterminate, int total, int processed) {
+            if (context == null) return;
+            MAIN.post(() -> {
+                if (dialog == null || !dialog.isShowing()) return;
+                dialog.setIndeterminate(indeterminate);
+                if (!indeterminate) {
+                    dialog.setMax(total);
+                    dialog.setProgress(Math.min(processed, total));
+                }
+                dialog.setMessage(message);
             });
         }
 
@@ -747,6 +805,137 @@ src = replace_once(
                 idOnly, where, selectionArgs, BaseColumns._ID);
 ''',
     "root-filtered scraper queries",
+)
+src = replace_once(
+    src,
+    "    private volatile String mRequestedRootPath;\n",
+    """    private volatile String mRequestedRootPath;
+    // Exact state for the FGL dialog: no retry or scheduling policy lives here.
+    private static final int FGL_SCRAPE_QUEUED = 0;
+    private static final int FGL_SCRAPE_WORKING = 1;
+    private static final int FGL_SCRAPE_COMPLETE = 2;
+    private static final int FGL_SCRAPE_EMPTY = 3;
+    private static final int FGL_SCRAPE_DISABLED = 4;
+    private static final int FGL_SCRAPE_BUSY = 5;
+    private static final int FGL_SCRAPE_START_ERROR = 6;
+    private static volatile int sFglScrapeState = FGL_SCRAPE_QUEUED;
+    private static volatile int sFglScrapeTotal = 0;
+    private static volatile int sFglScrapeProcessed = 0;
+    private static volatile int sFglScrapeMatched = 0;
+
+    public static int[] getFglScrapeStatus() {
+        return new int[]{sFglScrapeState, sFglScrapeTotal,
+                sFglScrapeProcessed, sFglScrapeMatched};
+    }
+""",
+    "FGL scraper diagnostic state",
+)
+src = replace_once(
+    src,
+    '''        Intent intent = new Intent(context, AutoScrapeService.class);
+        intent.putExtra(EXTRA_ROOT_PATH, rootPath);
+        try {
+            context.startService(intent);
+        } catch (Exception e) {
+            clearPostScanPendingIfNoWorker(context);
+            log.warn("startServiceForRoot: unable to start scraper for {}", rootPath, e);
+        }
+''',
+    '''        Intent intent = new Intent(context, AutoScrapeService.class);
+        intent.putExtra(EXTRA_ROOT_PATH, rootPath);
+        sFglScrapeState = FGL_SCRAPE_QUEUED;
+        sFglScrapeTotal = 0;
+        sFglScrapeProcessed = 0;
+        sFglScrapeMatched = 0;
+        try {
+            context.startService(intent);
+        } catch (Exception e) {
+            clearPostScanPendingIfNoWorker(context);
+            sFglScrapeState = FGL_SCRAPE_START_ERROR;
+            log.warn("startServiceForRoot: unable to start scraper for {}", rootPath, e);
+        }
+''',
+    "FGL scraper request state",
+)
+src = replace_once(
+    src,
+    '''        if (onlyNotFound) sRescanOnlyNotFound = true;
+        final String rootPath = mRequestedRootPath;
+
+        Thread worker = new Thread() {
+''',
+    '''        if (onlyNotFound) sRescanOnlyNotFound = true;
+        final String rootPath = mRequestedRootPath;
+        if (rootPath != null && !isEnable(this)) {
+            sFglScrapeState = FGL_SCRAPE_DISABLED;
+            return;
+        }
+
+        Thread worker = new Thread() {
+''',
+    "FGL scraper preference state",
+)
+src = replace_once(
+    src,
+    '''                            if (numberOfRows <= 0) {
+                                return;
+                            }
+                            sNumberOfFilesRemainingToProcess = numberOfRows;
+                            sTotalNumberOfFilesRemainingToProcess = numberOfRows;
+''',
+    '''                            if (rootPath != null) {
+                                sFglScrapeTotal = numberOfRows;
+                                sFglScrapeProcessed = 0;
+                                sFglScrapeMatched = 0;
+                            }
+                            if (numberOfRows <= 0) {
+                                if (rootPath != null) sFglScrapeState = FGL_SCRAPE_EMPTY;
+                                return;
+                            }
+                            if (rootPath != null) sFglScrapeState = FGL_SCRAPE_WORKING;
+                            sNumberOfFilesRemainingToProcess = numberOfRows;
+                            sTotalNumberOfFilesRemainingToProcess = numberOfRows;
+''',
+    "FGL scraper selected-row state",
+)
+src = replace_once(
+    src,
+    '''                                sNumberOfFilesRemainingToProcess--;
+                                sTotalNumberOfFilesRemainingToProcess--;
+''',
+    '''                                sNumberOfFilesRemainingToProcess--;
+                                sTotalNumberOfFilesRemainingToProcess--;
+                                if (rootPath != null) {
+                                    sFglScrapeProcessed++;
+                                    sFglScrapeMatched = sNumberOfFilesScraped;
+                                }
+''',
+    "FGL scraper per-file state",
+)
+src = replace_once(
+    src,
+    '''                        } finally {
+                            mScrapeRootPath.remove();
+                            releaseScrapeWorker(current);
+''',
+    '''                        } finally {
+                            if (rootPath != null && sFglScrapeState == FGL_SCRAPE_WORKING)
+                                sFglScrapeState = FGL_SCRAPE_COMPLETE;
+                            mScrapeRootPath.remove();
+                            releaseScrapeWorker(current);
+''',
+    "FGL scraper completion state",
+)
+src = replace_once(
+    src,
+    '''        if (!claimScrapeWorker(worker)) {
+            if (log.isDebugEnabled()) log.debug("startScraping: a scrape worker is already active");
+''',
+    '''        if (!claimScrapeWorker(worker)) {
+            if (rootPath != null) sFglScrapeState = FGL_SCRAPE_BUSY;
+            if (log.isDebugEnabled()) log.debug("startScraping: a scrape worker is already active");
+''',
+    "FGL scraper busy state",
 )
 auto_scraper.write_text(src)
 print("Patched FGL library root, bulk scan and root-scoped auto-scraper")
