@@ -170,7 +170,13 @@ public final class FglLibraryManager {
             indexed = countIndexedVideos(context, root.getPath());
             int found = NetworkScannerServiceVideo.getFilesFoundCount();
             progress.importing(found, indexed, expectedVideos, attempt + 1);
-            if (indexed >= expectedVideos) {
+            /*
+             * The physical directory count is diagnostic only. Nova legitimately
+             * omits duplicates and non-importable video files, so equality here
+             * would strand a successful library before metadata scraping.
+             */
+            boolean scannerFinished = found > 0 && !NetworkScannerServiceVideo.isScannerAlive();
+            if (scannerFinished && indexed > 0) {
                 AutoScrapeService.startServiceForRoot(context, root.getPath());
                 sScanRunning.set(false);
                 progress.finished(context.getString(R.string.fgl_library_scraping, indexed));
