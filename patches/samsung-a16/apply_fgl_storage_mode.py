@@ -162,11 +162,14 @@ src = replace_once(
     '''    @Override
     protected Uri getDefaultDirectory() {
         Uri mountUri = Uri.parse(currentMountPoint);
-        // Uri.parse("/storage/...") has no scheme. Filecore then treats it as
-        // a remote path and emits the misleading network-folder error. Make
-        // local removable storage unambiguously file:// before listing.
-        return mountUri.getScheme() == null
-                ? Uri.fromFile(new File(currentMountPoint)) : mountUri;
+        // The removable-storage category contains local mounts only, but Nova
+        // can represent one either as /storage/... or archosfile:/storage/...
+        // (the latter is used for Android's media broadcasts). Filecore does
+        // not reliably recognise either form as a local directory. Always
+        // give the listing engine an unambiguous file:// URI instead.
+        String localPath = mountUri.getScheme() == null
+                ? currentMountPoint : mountUri.getPath();
+        return Uri.fromFile(new File(localPath));
     }
 ''',
     "local mount URI",
