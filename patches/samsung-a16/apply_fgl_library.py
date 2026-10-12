@@ -284,20 +284,13 @@ public final class FglLibraryManager {
                 dialog.setMessage(context.getString(R.string.fgl_library_preparing));
                 dialog.setProgressStyle(NovaProgressDialog.STYLE_HORIZONTAL);
                 dialog.setIndeterminate(true);
-                // A tap outside the dialog must not make a long-running scan
-                // look as if it stopped. The user can always leave the app;
-                // an explicit OK button appears when this job has a result.
-                dialog.setCancelable(false);
+                // Only Android's actual back action may cancel this job.
+                // Outside taps remain disabled, but setCancelable(true) is
+                // required for Dialog to route the system back arrow through
+                // OnCancelListener on Samsung's Android build.
+                dialog.setCancelable(true);
                 dialog.setCanceledOnTouchOutside(false);
-                dialog.setOnKeyListener((ignored, keyCode, event) -> {
-                    if (keyCode == KeyEvent.KEYCODE_BACK
-                            && event.getAction() == KeyEvent.ACTION_UP) {
-                        cancelByBackArrow();
-                        return true;
-                    }
-                    return keyCode == KeyEvent.KEYCODE_BACK;
-                });
-                installBackInterceptor(owner);
+                dialog.setOnCancelListener(ignored -> cancelByBackArrow());
                 owner.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 dialog.show();
             });
