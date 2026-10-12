@@ -422,6 +422,48 @@ src = replace_once(
 ''',
     "FGL local-scan execution gate",
 )
+src = replace_once(
+    src,
+    "                        doScan(uri, scanBatchId);\n",
+    "                        doScan(uri, scanBatchId, fglLocalScan);\n",
+    "FGL local-scan worker flag",
+)
+src = replace_once(
+    src,
+    "    void doScan(Uri what, long batchId) {\n",
+    "    void doScan(Uri what, long batchId, boolean fglLocalScan) {\n",
+    "FGL local-scan method flag",
+)
+src = replace_once(
+    src,
+    '''            try {
+                com.archos.mediascraper.AutoScrapeService.NetworkScanCompletion completion =
+                        com.archos.mediascraper.AutoScrapeService.completeNetworkScan(batchId, scanHadDbError, scanResolved);
+                if (log.isDebugEnabled()) {
+                    log.debug("doScan: completed network scan, completedBatch={}, batchHadError={}, batchHadSuccess={}",
+                            completion.completedBatch, completion.batchHadError, completion.batchHadSuccess);
+                }
+                com.archos.mediascraper.AutoScrapeService.handleNetworkScanCompletion(this, completion);
+            } finally {
+''',
+    '''            try {
+                if (fglLocalScan) {
+                    // FGL owns the following root-scoped scrape. Do not let the
+                    // network scanner also start Nova's global scraper.
+                    if (log.isDebugEnabled()) log.debug("doScan: FGL local scan completed; suppress global auto-scrape");
+                } else {
+                    com.archos.mediascraper.AutoScrapeService.NetworkScanCompletion completion =
+                            com.archos.mediascraper.AutoScrapeService.completeNetworkScan(batchId, scanHadDbError, scanResolved);
+                    if (log.isDebugEnabled()) {
+                        log.debug("doScan: completed network scan, completedBatch={}, batchHadError={}, batchHadSuccess={}",
+                                completion.completedBatch, completion.batchHadError, completion.batchHadSuccess);
+                    }
+                    com.archos.mediascraper.AutoScrapeService.handleNetworkScanCompletion(this, completion);
+                }
+            } finally {
+''',
+    "suppress global scraper for FGL local scan",
+)
 network_scanner.write_text(src)
 
 src = folder_browser.read_text()
