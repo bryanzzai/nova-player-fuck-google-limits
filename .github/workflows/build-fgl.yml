@@ -45,6 +45,7 @@ jobs:
         run: |
           python3 ../fgl/patches/samsung-a16/apply_all_files_access.py
           python3 ../fgl/patches/samsung-a16/apply_fgl_storage_mode.py
+          python3 ../fgl/patches/samsung-a16/apply_fgl_library.py
           python3 ../fgl/patches/samsung-a16/apply_fgl_name.py
       - name: Compile FGL debug APK using Nova special-storage flavor
         working-directory: source/Video
