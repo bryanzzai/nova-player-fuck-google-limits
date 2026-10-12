@@ -702,6 +702,19 @@ src = replace_once(
 )
 src = replace_once(
     src,
+    """                            if (numberOfRows <= 0) {
+                                return;
+                            }
+""",
+    """                            if (numberOfRows <= 0) {
+                                if (rootPath != null) sFglState = 2;
+                                return;
+                            }
+""",
+    "FGL empty metadata batch completion",
+)
+src = replace_once(
+    src,
     """                                sNumberOfFilesRemainingToProcess--;
                                 sTotalNumberOfFilesRemainingToProcess--;
 """,
