@@ -95,8 +95,19 @@ src = replace_once(
         }
     }
 ''',
-    '''    @Override
+    '''    private void normalizeFglLocalDirectory() {
+        // BrowserByFolder restores CURRENT_DIRECTORY from fragment state. After
+        // Android's special-access Settings screen that state can still be a
+        // raw path or archosfile: URI, which bypasses getDefaultDirectory().
+        // This fragment is the removable-storage root, so it must always enter
+        // Filecore with a normal file:// URI.
+        if (mCurrentDirectory == null || !"file".equals(mCurrentDirectory.getScheme()))
+            mCurrentDirectory = getDefaultDirectory();
+    }
+
+    @Override
     public void onResume() {
+        normalizeFglLocalDirectory();
         super.onResume();
         mFglListingRetries = 0;
         // FGL uses Android's already-approved all-files access.  Do not turn a
@@ -118,31 +129,30 @@ if start != -1:
     if end == -1:
         raise SystemExit("Unexpected upstream source while removing SAF permission dialog")
     src = src[:start] + '''    private boolean retryFglLocalListing() {
-        if (mFglListingRetries < 3) {
-            int retry = ++mFglListingRetries;
-            // Android may still be publishing the local removable volume just
-            // after the special-access Settings screen closes. Retry every
-            // initial local-listing failure; a raw mount path must never fall
-            // through to Nova's remote-folder error page.
-            mHandler.removeCallbacksAndMessages(null);
-            mHandler.postDelayed(() -> {
-                if (isAdded()) listFiles(false);
-            }, 300L * retry);
-            return true;
-        }
-        return false;
+        int retry = ++mFglListingRetries;
+        // Samsung may publish a removable volume several seconds after the
+        // settings activity returns. Keep this local root on its own retry
+        // path; it must never fall through to BrowserByFolder's generic
+        // network-folder failure page.
+        long delay = Math.min(2000L, 250L * retry);
+        mHandler.removeCallbacksAndMessages(null);
+        mHandler.postDelayed(() -> {
+            if (isAdded()) {
+                normalizeFglLocalDirectory();
+                listFiles(false);
+            }
+        }, delay);
+        return true;
     }
 
     @Override
     public void onListingFatalError(Exception e, ListingEngine.ErrorEnum errorCode) {
-        if (retryFglLocalListing()) return;
-        super.onListingFatalError(e, errorCode);
+        retryFglLocalListing();
     }
 
     @Override
     public void onListingTimeOut() {
-        if (retryFglLocalListing()) return;
-        super.onListingTimeOut();
+        retryFglLocalListing();
     }
 
 ''' + src[end:]
