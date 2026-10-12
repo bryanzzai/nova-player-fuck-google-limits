@@ -183,13 +183,44 @@ public final class FglLibraryManager {
             if (indexed >= expectedVideos ||
                     (indexed >= nearComplete && stableSeconds >= settleSeconds)) {
                 AutoScrapeService.startServiceForRoot(context, root.getPath());
+                progress.scraping(0, 0, 0, false);
+                final int importedCount = indexed;
+                new Thread(() -> watchMetadataProgress(progress, importedCount),
+                        "FglMetadataProgress").start();
                 sScanRunning.set(false);
-                progress.finished(context.getString(R.string.fgl_library_scraping, indexed));
                 return;
             }
         }
         sScanRunning.set(false);
         progress.finished(context.getString(R.string.fgl_library_import_failed, indexed, expectedVideos));
+    }
+
+    /** UI updates use actual scraper counters, not a simulated progress timer. */
+    private static void watchMetadataProgress(ProgressReporter progress, int indexedCount) {
+        boolean started = false;
+        for (int second = 0; second < 60 * 60; second++) {
+            if (sCancelRequested.get()) return;
+            int[] state = AutoScrapeService.getFglProgress();
+            if (state[0] == 1) {
+                started = true;
+                progress.scraping(state[1], state[2], state[3], true);
+            } else if (state[0] == 2) {
+                progress.scraping(state[1], state[2], state[3], true);
+                progress.finished("Metadata complete: " + state[2] + " processed, "
+                        + state[3] + " matched; library has " + indexedCount + " videos");
+                return;
+            } else if (started) {
+                progress.finished("Metadata scan stopped; " + state[2] + " processed.");
+                return;
+            }
+            try {
+                Thread.sleep(1000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        progress.finished("Metadata monitoring timed out; check Nova's scraping notification.");
     }
 
     private static int countIndexedVideos(Context context, String rootPath) {
@@ -337,6 +368,23 @@ public final class FglLibraryManager {
                 dialog.setProgress(Math.min(current, total));
                 dialog.setMessage(context.getString(R.string.fgl_library_importing,
                         found, current, total, elapsedSeconds / 60, elapsedSeconds % 60));
+            });
+        }
+
+        void scraping(int total, int processed, int matched, boolean active) {
+            if (context == null) return;
+            MAIN.post(() -> {
+                if (dialog == null || !dialog.isShowing()) return;
+                if (total <= 0) {
+                    dialog.setIndeterminate(true);
+                    dialog.setMessage("Starting Nova metadata scanner…");
+                } else {
+                    dialog.setIndeterminate(false);
+                    dialog.setMax(total);
+                    dialog.setProgress(Math.min(processed, total));
+                    dialog.setMessage("Metadata: " + processed + "/" + total
+                            + " processed, " + matched + " matched");
+                }
             });
         }
 
@@ -567,6 +615,10 @@ src = replace_once(
         mContext = context.getApplicationContext();
         Intent intent = new Intent(context, AutoScrapeService.class);
         intent.putExtra(EXTRA_ROOT_PATH, rootPath);
+        sFglState = 0;
+        sFglTotal = 0;
+        sFglProcessed = 0;
+        sFglMatched = 0;
         try {
             context.startService(intent);
         } catch (Exception e) {
@@ -576,6 +628,22 @@ src = replace_once(
     }
 ''',
     "root scrape launcher",
+)
+src = replace_once(
+    src,
+    "    private volatile String mRequestedRootPath;\n",
+    """    private volatile String mRequestedRootPath;
+    // Snapshot for the FGL library dialog: 0=queued, 1=working, 2=finished.
+    private static volatile int sFglState = 0;
+    private static volatile int sFglTotal = 0;
+    private static volatile int sFglProcessed = 0;
+    private static volatile int sFglMatched = 0;
+
+    public static int[] getFglProgress() {
+        return new int[]{sFglState, sFglTotal, sFglProcessed, sFglMatched};
+    }
+""",
+    "FGL live metadata counters",
 )
 src = replace_once(
     src,
@@ -618,6 +686,36 @@ src = replace_once(
 )
 src = replace_once(
     src,
+    """                            sNumberOfFilesRemainingToProcess = numberOfRows;
+                            sTotalNumberOfFilesRemainingToProcess = numberOfRows;
+""",
+    """                            sNumberOfFilesRemainingToProcess = numberOfRows;
+                            sTotalNumberOfFilesRemainingToProcess = numberOfRows;
+                            if (rootPath != null) {
+                                sFglTotal = numberOfRows;
+                                sFglProcessed = 0;
+                                sFglMatched = 0;
+                                sFglState = 1;
+                            }
+""",
+    "FGL metadata total",
+)
+src = replace_once(
+    src,
+    """                                sNumberOfFilesRemainingToProcess--;
+                                sTotalNumberOfFilesRemainingToProcess--;
+""",
+    """                                sNumberOfFilesRemainingToProcess--;
+                                sTotalNumberOfFilesRemainingToProcess--;
+                                if (rootPath != null) {
+                                    sFglProcessed++;
+                                    sFglMatched = sNumberOfFilesScraped;
+                                }
+""",
+    "FGL metadata per-video progress",
+)
+src = replace_once(
+    src,
     '''                        } finally {
                             releaseScrapeWorker(current);
 ''',
@@ -626,6 +724,15 @@ src = replace_once(
                             releaseScrapeWorker(current);
 ''',
     "root scrape worker cleanup",
+)
+src = replace_once(
+    src,
+    """                            releaseScrapeWorker(current);
+""",
+    """                            if (rootPath != null) sFglState = 2;
+                            releaseScrapeWorker(current);
+""",
+    "FGL metadata completion status",
 )
 src = replace_once(
     src,
