@@ -143,7 +143,7 @@ public final class FglLibraryManager {
         if (finishIfCancelled(progress)) return;
         PreferenceManager.getDefaultSharedPreferences(context)
                 .edit().putLong(PREF_LAST_SCAN, System.currentTimeMillis()).apply();
-        progress.importing(0, expectedVideos, 0);
+        progress.importing(0, 0, expectedVideos, 0);
         // MediaStore is unreliable for the user-approved USB/SD root on this
         // device. Use Nova's proven recursive scanner instead: it walks
         // MetaFile2 directly and writes Nova's files table, just as SMB does.
@@ -168,7 +168,8 @@ public final class FglLibraryManager {
                 break;
             }
             indexed = countIndexedVideos(context, root.getPath());
-            progress.importing(indexed, expectedVideos, attempt + 1);
+            int found = NetworkScannerServiceVideo.getFilesFoundCount();
+            progress.importing(found, indexed, expectedVideos, attempt + 1);
             if (indexed >= expectedVideos) {
                 AutoScrapeService.startServiceForRoot(context, root.getPath());
                 sScanRunning.set(false);
@@ -317,14 +318,14 @@ public final class FglLibraryManager {
             });
         }
 
-        void importing(int current, int total, int elapsedSeconds) {
+        void importing(int found, int current, int total, int elapsedSeconds) {
             if (context == null) return;
             MAIN.post(() -> {
                 if (dialog == null || !dialog.isShowing()) return;
                 dialog.setMax(total);
                 dialog.setProgress(Math.min(current, total));
                 dialog.setMessage(context.getString(R.string.fgl_library_importing,
-                        current, total, elapsedSeconds / 60, elapsedSeconds % 60));
+                        found, current, total, elapsedSeconds / 60, elapsedSeconds % 60));
             });
         }
 
@@ -364,15 +365,18 @@ src = replace_once(
     src,
     "    public static boolean startIfHandles(Context context, Intent broadcast) {\n",
     '''    /**
-     * FGL's local-library entrypoint.  The normal receiver deliberately
-     * rejects file:// URLs because they belong to MediaStore; FGL has explicit
+     * FGL's local-library entrypoint. The normal receiver deliberately rejects
+     * file:// URLs because they belong to MediaStore; FGL has explicit
      * all-files consent and uses this direct, root-scoped call instead.
      */
+    private static final String EXTRA_FGL_LOCAL_SCAN = "fgl_local_scan";
+
     public static boolean startFglLocalScan(Context context, Uri root) {
         if (root == null || !"file".equals(root.getScheme())) return false;
         Intent intent = new Intent(context, NetworkScannerServiceVideo.class);
         intent.setAction(ArchosMediaIntent.ACTION_VIDEO_SCANNER_SCAN_FILE);
         intent.setData(root);
+        intent.putExtra(EXTRA_FGL_LOCAL_SCAN, true);
         if (Build.VERSION.SDK_INT >= 29) intent.setIdentifier(root.toString());
         try {
             context.startService(intent);
@@ -386,6 +390,31 @@ src = replace_once(
     public static boolean startIfHandles(Context context, Intent broadcast) {
 ''',
     "FGL direct local scanner entrypoint",
+)
+src = replace_once(
+    src,
+    '''                Bundle scanData = new Bundle();
+                scanData.putLong(EXTRA_SCAN_BATCH_ID, batchId);
+                m.setData(scanData);
+''',
+    '''                Bundle scanData = new Bundle();
+                scanData.putLong(EXTRA_SCAN_BATCH_ID, batchId);
+                scanData.putBoolean(EXTRA_FGL_LOCAL_SCAN,
+                        intent.getBooleanExtra(EXTRA_FGL_LOCAL_SCAN, false));
+                m.setData(scanData);
+''',
+    "FGL local-scan request flag",
+)
+src = replace_once(
+    src,
+    '''                if (isForeground || pendingScans > 0) {
+                    if (log.isDebugEnabled()) log.debug("handleMessage: processing scan (isForeground={}, pendingScans={})", isForeground, pendingScans);
+''',
+    '''                boolean fglLocalScan = msg.getData().getBoolean(EXTRA_FGL_LOCAL_SCAN, false);
+                if (isForeground || pendingScans > 0 || fglLocalScan) {
+                    if (log.isDebugEnabled()) log.debug("handleMessage: processing scan (isForeground={}, pendingScans={}, fglLocalScan={})", isForeground, pendingScans, fglLocalScan);
+''',
+    "FGL local-scan execution gate",
 )
 network_scanner.write_text(src)
 
@@ -476,7 +505,7 @@ src = replace_once(
     "    <string name=\"fgl_library_dialog_title\">Nova FGL library</string>\n"
     "    <string name=\"fgl_library_preparing\">Finding video files…</string>\n"
     "    <string name=\"fgl_library_indexing\">Indexing %1$d of %2$d video files</string>\n"
-    "    <string name=\"fgl_library_importing\">Adding %1$d of %2$d videos to Nova (%3$d:%4$02d)</string>\n"
+    "    <string name=\"fgl_library_importing\">Scanner found %1$d; Nova added %2$d of %3$d (%4$d:%5$02d)</string>\n"
     "    <string name=\"fgl_library_scraping\">Indexed %1$d videos. Fetching metadata…</string>\n"
     "    <string name=\"fgl_library_no_videos\">No video files were found in this library</string>\n"
     "    <string name=\"fgl_library_import_failed\">Only %1$d of %2$d videos reached Nova’s library</string>\n",
