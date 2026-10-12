@@ -185,7 +185,7 @@ public final class FglLibraryManager {
                 AutoScrapeService.startServiceForRoot(context, root.getPath());
                 progress.scraping(0, 0, 0, false);
                 final int importedCount = indexed;
-                new Thread(() -> watchMetadataProgress(progress, importedCount),
+                new Thread(() -> watchMetadataProgress(context, root.getPath(), progress, importedCount),
                         "FglMetadataProgress").start();
                 sScanRunning.set(false);
                 return;
@@ -196,7 +196,8 @@ public final class FglLibraryManager {
     }
 
     /** UI updates use actual scraper counters, not a simulated progress timer. */
-    private static void watchMetadataProgress(ProgressReporter progress, int indexedCount) {
+    private static void watchMetadataProgress(Context context, String rootPath,
+            ProgressReporter progress, int indexedCount) {
         boolean started = false;
         for (int second = 0; second < 60 * 60; second++) {
             if (sCancelRequested.get()) return;
@@ -213,8 +214,13 @@ public final class FglLibraryManager {
                 progress.finished("Metadata service failed to start. Check service logs.");
                 return;
             } else if (state[0] == 4) {
-                progress.finished("Metadata scraper is busy with another scan. Retry when it finishes.");
-                return;
+                progress.waitingForScraper();
+                // Nova may have automatically started its own scrape as the
+                // library was indexed. Wait for that worker and retry the
+                // scoped FGL request rather than treating that as a failure.
+                if (second % 5 == 0 && !AutoScrapeService.isFglWorkerOccupied()) {
+                    AutoScrapeService.startServiceForRoot(context, rootPath);
+                }
             } else if (started) {
                 progress.finished("Metadata scan stopped; " + state[2] + " processed.");
                 return;
@@ -377,6 +383,15 @@ public final class FglLibraryManager {
                 dialog.setProgress(Math.min(current, total));
                 dialog.setMessage(context.getString(R.string.fgl_library_importing,
                         found, current, total, elapsedSeconds / 60, elapsedSeconds % 60));
+            });
+        }
+
+        void waitingForScraper() {
+            if (context == null) return;
+            MAIN.post(() -> {
+                if (dialog == null || !dialog.isShowing()) return;
+                dialog.setIndeterminate(true);
+                dialog.setMessage("Nova is finishing another metadata pass; waiting to scan USB library…");
             });
         }
 
@@ -652,6 +667,10 @@ src = replace_once(
 
     public static int[] getFglProgress() {
         return new int[]{sFglState, sFglTotal, sFglProcessed, sFglMatched};
+    }
+
+    public static boolean isFglWorkerOccupied() {
+        return sScrapeWorker.get() != null;
     }
 """,
     "FGL live metadata counters",
