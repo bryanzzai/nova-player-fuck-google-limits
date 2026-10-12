@@ -32,6 +32,8 @@ for line in (
     "import android.app.Activity;\n",
     "import android.content.DialogInterface;\n",
     "import android.os.Build;\n",
+    "import androidx.activity.result.ActivityResultLauncher;\n",
+    "import androidx.activity.result.contract.ActivityResultContracts;\n",
     "import androidx.appcompat.app.AlertDialog;\n",
     "import androidx.loader.app.LoaderManager;\n",
     "import com.archos.filecorelibrary.contentstorage.DocumentUriBuilder;\n",
@@ -41,6 +43,15 @@ for line in (
     "import java.io.File;\n",
 ):
     src = src.replace(line, "")
+start = src.find(
+    "    private final ActivityResultLauncher<Intent> docTreeLauncher = "
+    "registerForActivityResult("
+)
+if start != -1:
+    end = src.find("\n\n    private final BroadcastReceiver", start)
+    if end == -1:
+        raise SystemExit("Unexpected upstream source while removing SAF result callback")
+    src = src[:start] + src[end + 2:]
 src = src.replace("    private static final int READ_REQUEST_CODE = 42;\n", "")
 src = src.replace("    private boolean mHasAlreadyAsked = false;\n", "")
 src = replace_once(
