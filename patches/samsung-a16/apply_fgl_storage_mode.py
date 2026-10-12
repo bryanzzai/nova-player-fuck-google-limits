@@ -39,9 +39,15 @@ for line in (
     "import com.archos.filecorelibrary.contentstorage.DocumentUriBuilder;\n",
     "import com.archos.mediacenter.filecoreextension.UriUtils;\n",
     "import com.archos.mediacenter.video.R;\n",
-    "import java.io.File;\n",
 ):
     src = src.replace(line, "")
+if "import java.io.File;\n" not in src:
+    src = replace_once(
+        src,
+        "import android.net.Uri;\n",
+        "import android.net.Uri;\n\nimport java.io.File;\n",
+        "local mount File import",
+    )
 start = src.find(
     "    private final ActivityResultLauncher<Intent> docTreeLauncher = "
     "registerForActivityResult("
@@ -111,22 +117,32 @@ if start != -1:
     end = src.find("    @Override\n    public void onSaveInstanceState", start)
     if end == -1:
         raise SystemExit("Unexpected upstream source while removing SAF permission dialog")
-    src = src[:start] + '''    @Override
-    public void onListingFatalError(Exception e, ListingEngine.ErrorEnum errorCode) {
-        if ((errorCode == ListingEngine.ErrorEnum.ERROR_AUTHENTICATION
-                || errorCode == ListingEngine.ErrorEnum.ERROR_NO_PERMISSION)
-                && mFglListingRetries < 3) {
+    src = src[:start] + '''    private boolean retryFglLocalListing() {
+        if (mFglListingRetries < 3) {
             int retry = ++mFglListingRetries;
-            // Android may still be publishing MANAGE_EXTERNAL_STORAGE just after
-            // the Settings screen closes. Retry the normal file listing; never
-            // fall back to SAF or leave Nova on a permanent loading page.
+            // Android may still be publishing the local removable volume just
+            // after the special-access Settings screen closes. Retry every
+            // initial local-listing failure; a raw mount path must never fall
+            // through to Nova's remote-folder error page.
             mHandler.removeCallbacksAndMessages(null);
             mHandler.postDelayed(() -> {
                 if (isAdded()) listFiles(false);
             }, 300L * retry);
-            return;
+            return true;
         }
+        return false;
+    }
+
+    @Override
+    public void onListingFatalError(Exception e, ListingEngine.ErrorEnum errorCode) {
+        if (retryFglLocalListing()) return;
         super.onListingFatalError(e, errorCode);
+    }
+
+    @Override
+    public void onListingTimeOut() {
+        if (retryFglLocalListing()) return;
+        super.onListingTimeOut();
     }
 
 ''' + src[end:]
@@ -136,6 +152,25 @@ if start != -1:
     if end == -1:
         raise SystemExit("Unexpected upstream source while removing SAF index root")
     src = src[:start] + src[end:]
+src = replace_once(
+    src,
+    '''    @Override
+    protected Uri getDefaultDirectory() {
+        return Uri.parse(currentMountPoint);
+    }
+''',
+    '''    @Override
+    protected Uri getDefaultDirectory() {
+        Uri mountUri = Uri.parse(currentMountPoint);
+        // Uri.parse("/storage/...") has no scheme. Filecore then treats it as
+        // a remote path and emits the misleading network-folder error. Make
+        // local removable storage unambiguously file:// before listing.
+        return mountUri.getScheme() == null
+                ? Uri.fromFile(new File(currentMountPoint)) : mountUri;
+    }
+''',
+    "local mount URI",
+)
 start = src.find("    @TargetApi(Build.VERSION_CODES.KITKAT)\n    public void onActivityResult(")
 if start != -1:
     end = src.rfind("\n}")
