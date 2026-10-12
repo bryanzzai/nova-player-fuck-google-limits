@@ -209,8 +209,17 @@ public final class FglLibraryManager {
                 progress.finished("Metadata complete: " + state[2] + " processed, "
                         + state[3] + " matched; library has " + indexedCount + " videos");
                 return;
+            } else if (state[0] == 3) {
+                progress.finished("Metadata service failed to start. Check service logs.");
+                return;
+            } else if (state[0] == 4) {
+                progress.finished("Metadata scraper is busy with another scan. Retry when it finishes.");
+                return;
             } else if (started) {
                 progress.finished("Metadata scan stopped; " + state[2] + " processed.");
+                return;
+            } else if (second >= 30) {
+                progress.finished("Metadata scraper did not start within 30 seconds. Check settings and logs.");
                 return;
             }
             try {
@@ -615,6 +624,7 @@ src = replace_once(
         mContext = context.getApplicationContext();
         Intent intent = new Intent(context, AutoScrapeService.class);
         intent.putExtra(EXTRA_ROOT_PATH, rootPath);
+        intent.putExtra("FORCE_AFTER_NETWORK_SCAN", true);
         sFglState = 0;
         sFglTotal = 0;
         sFglProcessed = 0;
@@ -623,6 +633,7 @@ src = replace_once(
             context.startService(intent);
         } catch (Exception e) {
             clearPostScanPendingIfNoWorker(context);
+            sFglState = 3;
             log.warn("startServiceForRoot: unable to start scraper for {}", rootPath, e);
         }
     }
@@ -633,7 +644,7 @@ src = replace_once(
     src,
     "    private volatile String mRequestedRootPath;\n",
     """    private volatile String mRequestedRootPath;
-    // Snapshot for the FGL library dialog: 0=queued, 1=working, 2=finished.
+    // FGL state: 0=queued, 1=working, 2=finished, 3=start error, 4=busy.
     private static volatile int sFglState = 0;
     private static volatile int sFglTotal = 0;
     private static volatile int sFglProcessed = 0;
@@ -746,6 +757,17 @@ src = replace_once(
                             releaseScrapeWorker(current);
 """,
     "FGL metadata completion status",
+)
+src = replace_once(
+    src,
+    """        if (!claimScrapeWorker(worker)) {
+            if (log.isDebugEnabled()) log.debug("startScraping: a scrape worker is already active");
+""",
+    """        if (!claimScrapeWorker(worker)) {
+            if (rootPath != null) sFglState = 4;
+            if (log.isDebugEnabled()) log.debug("startScraping: a scrape worker is already active");
+""",
+    "FGL worker busy error",
 )
 src = replace_once(
     src,
