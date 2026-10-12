@@ -159,6 +159,12 @@ public final class FglLibraryManager {
     private static void waitForImport(Context context, File root, int expectedVideos,
             ProgressReporter progress) {
         int indexed = 0;
+        int previousIndexed = -1;
+        int stableSeconds = 0;
+        // The filesystem pre-count and Nova's database may disagree slightly.
+        // Allow metadata scraping after a nearly complete import settles.
+        final int nearComplete = Math.max(1, (int) Math.ceil(expectedVideos * 0.99));
+        final int settleSeconds = 45;
         for (int attempt = 0; attempt < IMPORT_WAIT_ATTEMPTS; attempt++) {
             if (finishIfCancelled(progress)) return;
             try {
@@ -169,8 +175,13 @@ public final class FglLibraryManager {
             }
             indexed = countIndexedVideos(context, root.getPath());
             int found = NetworkScannerServiceVideo.getFilesFoundCount();
+            stableSeconds = indexed == previousIndexed ? stableSeconds + 1 : 0;
+            previousIndexed = indexed;
             progress.importing(found, indexed, expectedVideos, attempt + 1);
-            if (indexed >= expectedVideos) {
+            // Exact count can return immediately. Otherwise wait until at least
+            // 99% is indexed and the count has remained stable for 45 seconds.
+            if (indexed >= expectedVideos ||
+                    (indexed >= nearComplete && stableSeconds >= settleSeconds)) {
                 AutoScrapeService.startServiceForRoot(context, root.getPath());
                 sScanRunning.set(false);
                 progress.finished(context.getString(R.string.fgl_library_scraping, indexed));
