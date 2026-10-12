@@ -159,12 +159,6 @@ public final class FglLibraryManager {
     private static void waitForImport(Context context, File root, int expectedVideos,
             ProgressReporter progress) {
         int indexed = 0;
-        int previousIndexed = -1;
-        int stableSeconds = 0;
-        // The filesystem pre-count and Nova's database may disagree slightly.
-        // Allow metadata scraping after a nearly complete import settles.
-        final int nearComplete = Math.max(1, (int) Math.ceil(expectedVideos * 0.99));
-        final int settleSeconds = 45;
         for (int attempt = 0; attempt < IMPORT_WAIT_ATTEMPTS; attempt++) {
             if (finishIfCancelled(progress)) return;
             try {
@@ -175,67 +169,16 @@ public final class FglLibraryManager {
             }
             indexed = countIndexedVideos(context, root.getPath());
             int found = NetworkScannerServiceVideo.getFilesFoundCount();
-            stableSeconds = indexed == previousIndexed ? stableSeconds + 1 : 0;
-            previousIndexed = indexed;
             progress.importing(found, indexed, expectedVideos, attempt + 1);
-            // Exact count can return immediately. Otherwise wait until at least
-            // 99% is indexed and the count has remained stable for 45 seconds.
-            if (indexed >= expectedVideos ||
-                    (indexed >= nearComplete && stableSeconds >= settleSeconds)) {
+            if (indexed >= expectedVideos) {
                 AutoScrapeService.startServiceForRoot(context, root.getPath());
-                progress.scraping(0, 0, 0, false);
-                final int importedCount = indexed;
-                new Thread(() -> watchMetadataProgress(context, root.getPath(), progress, importedCount),
-                        "FglMetadataProgress").start();
                 sScanRunning.set(false);
+                progress.finished(context.getString(R.string.fgl_library_scraping, indexed));
                 return;
             }
         }
         sScanRunning.set(false);
         progress.finished(context.getString(R.string.fgl_library_import_failed, indexed, expectedVideos));
-    }
-
-    /** UI updates use actual scraper counters, not a simulated progress timer. */
-    private static void watchMetadataProgress(Context context, String rootPath,
-            ProgressReporter progress, int indexedCount) {
-        boolean started = false;
-        for (int second = 0; second < 60 * 60; second++) {
-            if (sCancelRequested.get()) return;
-            int[] state = AutoScrapeService.getFglProgress();
-            if (state[0] == 1) {
-                started = true;
-                progress.scraping(state[1], state[2], state[3], true);
-            } else if (state[0] == 2) {
-                progress.scraping(state[1], state[2], state[3], true);
-                progress.finished("Metadata complete: " + state[2] + " processed, "
-                        + state[3] + " matched; library has " + indexedCount + " videos");
-                return;
-            } else if (state[0] == 3) {
-                progress.finished("Metadata service failed to start. Check service logs.");
-                return;
-            } else if (state[0] == 4) {
-                progress.waitingForScraper();
-                // Nova may have automatically started its own scrape as the
-                // library was indexed. Wait for that worker and retry the
-                // scoped FGL request rather than treating that as a failure.
-                if (second % 5 == 0 && !AutoScrapeService.isFglWorkerOccupied()) {
-                    AutoScrapeService.startServiceForRoot(context, rootPath);
-                }
-            } else if (started) {
-                progress.finished("Metadata scan stopped; " + state[2] + " processed.");
-                return;
-            } else if (second >= 30) {
-                progress.finished("Metadata scraper did not start within 30 seconds. Check settings and logs.");
-                return;
-            }
-            try {
-                Thread.sleep(1000L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-        }
-        progress.finished("Metadata monitoring timed out; check Nova's scraping notification.");
     }
 
     private static int countIndexedVideos(Context context, String rootPath) {
@@ -383,32 +326,6 @@ public final class FglLibraryManager {
                 dialog.setProgress(Math.min(current, total));
                 dialog.setMessage(context.getString(R.string.fgl_library_importing,
                         found, current, total, elapsedSeconds / 60, elapsedSeconds % 60));
-            });
-        }
-
-        void waitingForScraper() {
-            if (context == null) return;
-            MAIN.post(() -> {
-                if (dialog == null || !dialog.isShowing()) return;
-                dialog.setIndeterminate(true);
-                dialog.setMessage("Nova is finishing another metadata pass; waiting to scan USB library…");
-            });
-        }
-
-        void scraping(int total, int processed, int matched, boolean active) {
-            if (context == null) return;
-            MAIN.post(() -> {
-                if (dialog == null || !dialog.isShowing()) return;
-                if (total <= 0) {
-                    dialog.setIndeterminate(true);
-                    dialog.setMessage("Starting Nova metadata scanner…");
-                } else {
-                    dialog.setIndeterminate(false);
-                    dialog.setMax(total);
-                    dialog.setProgress(Math.min(processed, total));
-                    dialog.setMessage("Metadata: " + processed + "/" + total
-                            + " processed, " + matched + " matched");
-                }
             });
         }
 
@@ -639,41 +556,15 @@ src = replace_once(
         mContext = context.getApplicationContext();
         Intent intent = new Intent(context, AutoScrapeService.class);
         intent.putExtra(EXTRA_ROOT_PATH, rootPath);
-        intent.putExtra("FORCE_AFTER_NETWORK_SCAN", true);
-        sFglState = 0;
-        sFglTotal = 0;
-        sFglProcessed = 0;
-        sFglMatched = 0;
         try {
             context.startService(intent);
         } catch (Exception e) {
             clearPostScanPendingIfNoWorker(context);
-            sFglState = 3;
             log.warn("startServiceForRoot: unable to start scraper for {}", rootPath, e);
         }
     }
 ''',
     "root scrape launcher",
-)
-src = replace_once(
-    src,
-    "    private volatile String mRequestedRootPath;\n",
-    """    private volatile String mRequestedRootPath;
-    // FGL state: 0=queued, 1=working, 2=finished, 3=start error, 4=busy.
-    private static volatile int sFglState = 0;
-    private static volatile int sFglTotal = 0;
-    private static volatile int sFglProcessed = 0;
-    private static volatile int sFglMatched = 0;
-
-    public static int[] getFglProgress() {
-        return new int[]{sFglState, sFglTotal, sFglProcessed, sFglMatched};
-    }
-
-    public static boolean isFglWorkerOccupied() {
-        return sScrapeWorker.get() != null;
-    }
-""",
-    "FGL live metadata counters",
 )
 src = replace_once(
     src,
@@ -716,49 +607,6 @@ src = replace_once(
 )
 src = replace_once(
     src,
-    """                            sNumberOfFilesRemainingToProcess = numberOfRows;
-                            sTotalNumberOfFilesRemainingToProcess = numberOfRows;
-""",
-    """                            sNumberOfFilesRemainingToProcess = numberOfRows;
-                            sTotalNumberOfFilesRemainingToProcess = numberOfRows;
-                            if (rootPath != null) {
-                                sFglTotal = numberOfRows;
-                                sFglProcessed = 0;
-                                sFglMatched = 0;
-                                sFglState = 1;
-                            }
-""",
-    "FGL metadata total",
-)
-src = replace_once(
-    src,
-    """                            if (numberOfRows <= 0) {
-                                return;
-                            }
-""",
-    """                            if (numberOfRows <= 0) {
-                                if (rootPath != null) sFglState = 2;
-                                return;
-                            }
-""",
-    "FGL empty metadata batch completion",
-)
-src = replace_once(
-    src,
-    """                                sNumberOfFilesRemainingToProcess--;
-                                sTotalNumberOfFilesRemainingToProcess--;
-""",
-    """                                sNumberOfFilesRemainingToProcess--;
-                                sTotalNumberOfFilesRemainingToProcess--;
-                                if (rootPath != null) {
-                                    sFglProcessed++;
-                                    sFglMatched = sNumberOfFilesScraped;
-                                }
-""",
-    "FGL metadata per-video progress",
-)
-src = replace_once(
-    src,
     '''                        } finally {
                             releaseScrapeWorker(current);
 ''',
@@ -767,26 +615,6 @@ src = replace_once(
                             releaseScrapeWorker(current);
 ''',
     "root scrape worker cleanup",
-)
-src = replace_once(
-    src,
-    """                            releaseScrapeWorker(current);
-""",
-    """                            if (rootPath != null) sFglState = 2;
-                            releaseScrapeWorker(current);
-""",
-    "FGL metadata completion status",
-)
-src = replace_once(
-    src,
-    """        if (!claimScrapeWorker(worker)) {
-            if (log.isDebugEnabled()) log.debug("startScraping: a scrape worker is already active");
-""",
-    """        if (!claimScrapeWorker(worker)) {
-            if (rootPath != null) sFglState = 4;
-            if (log.isDebugEnabled()) log.debug("startScraping: a scrape worker is already active");
-""",
-    "FGL worker busy error",
 )
 src = replace_once(
     src,
